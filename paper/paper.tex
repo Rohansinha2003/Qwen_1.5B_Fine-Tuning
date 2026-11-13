@@ -1,0 +1,215 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\setlist{itemsep=2pt,topsep=4pt}
+\title{\textbf{One Fine-Tune, Two Verdicts:\\A Low-Budget Case Study of QLoRA Fine-Tuning\\Qwen2.5-Coder-1.5B on Synthetic Python Data}}
+\author{Rohan Sinha}
+\date{November 2026}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Small open code models are often fine-tuned by individuals on free hardware, and the results are usually reported as a single benchmark number. We fine-tune Qwen2.5-Coder-1.5B-Instruct with QLoRA on 9,799 test-verified Python examples from OpenCodeInstruct, using two free Kaggle T4 GPUs for 58 minutes. We then evaluate the base model and three training checkpoints on HumanEval (164 problems) and MBPP (257 problems). The two benchmarks disagree. On HumanEval the fine-tuned model is within noise of the base (65.9\% against 67.1\%). On MBPP it scores 67.3\% against 59.5\%, a gain of 7.8 points that is suggestive but not conclusive at this sample size. The MBPP gain is already present after one third of training, and further steps add nothing. Changing only the evaluation harness settings moved every HumanEval score by three problems. We conclude that a single benchmark number is not enough to judge a small fine-tune, and we give a practical checklist for reliable low-budget training and evaluation.
+\end{abstract}
+
+\section{Introduction}
+Fine-tuning a small language model has become cheap. Adapter methods such as LoRA~\cite{lora} and QLoRA~\cite{qlora} train about 1\% of the weights, and a 1.5-billion-parameter model fits on a free cloud GPU. As a result, model hubs hold thousands of community fine-tunes.
+
+Most of these models are published with one benchmark score or none. That makes it hard to know whether the fine-tune helped. The question matters more for small code models, because their base versions are already tuned on large amounts of instruction data. There may be little left to gain.
+
+This paper asks a simple question. If one person fine-tunes a strong 1.5B code model on public synthetic data, with free hardware and about one hour of training, does the model get better? And how sure can we be of the answer?
+
+We make three contributions.
+\begin{enumerate}
+\item \textbf{A two-benchmark comparison with error bars.} The fine-tune does not improve HumanEval but scores 7.8 points higher on MBPP. A report based on either benchmark alone would reach the wrong overall conclusion.
+\item \textbf{A checkpoint study.} We evaluate checkpoints at steps 200, 400 and 613. The benchmark gain appears early and then stops, while the training loss keeps looking healthy.
+\item \textbf{A measurement of harness sensitivity.} Two reasonable harness settings give HumanEval scores that differ by three problems for the same model. That is larger than the gap between the base and the fine-tune.
+\end{enumerate}
+We also document the engineering problems of free-tier training and how we solved them, since they decide whether such a study finishes at all.
+
+\section{Background}
+\paragraph{Base model.} Qwen2.5-Coder-1.5B-Instruct is an open code model with about 1.54 billion parameters, released under Apache-2.0~\cite{qwen}. It is already instruction-tuned.
+
+\paragraph{Training data.} OpenCodeInstruct is a synthetic dataset of 5 million coding question and answer pairs released by NVIDIA under CC BY 4.0~\cite{oci}. Each row carries generated unit tests and an average test score for the answer.
+
+\paragraph{LoRA and QLoRA.} LoRA freezes the model and trains small low-rank matrices added to chosen layers~\cite{lora}. QLoRA does the same on a base model loaded in 4-bit precision, which cuts memory use enough for small GPUs~\cite{qlora}.
+
+\paragraph{Benchmarks.} HumanEval has 164 Python problems. Each gives a function signature and docstring, and the model completes the function~\cite{humaneval}. MBPP gives a short task description in plain language and a few test cases~\cite{mbpp}. We use the test split of its sanitized version, which has 257 problems. Both report pass@1: the share of problems where the first answer passes all tests. Later work showed that the original tests in both benchmarks can miss wrong solutions~\cite{evalplus}.
+
+\section{Method}
+\subsection{Data selection}
+We stream the dataset with a shuffle buffer (seed 42) so the full 6.4\,GB is never downloaded. We keep a row only if its answer contains a Python code block and its average test score is 1.0, meaning the answer passed all its generated tests. We stop at 10,000 rows. After removing rows whose prompt is too long, 9,799 are used for training and 200 are held out for validation loss.
+
+\subsection{Prompt format and loss}
+Each example uses the model's own chat template with one fixed system message: ``You are an expert Python programmer. Answer with correct, complete, runnable Python code.'' Sequences are cut at 1,024 tokens. The loss is computed on the answer tokens only. Prompt tokens are masked.
+
+\subsection{Training setup}
+Table~\ref{tab:setup} lists the configuration. A checkpoint was saved every 100 steps and uploaded to a model hub during training. For evaluation, each adapter is merged into the full-precision (fp16) base model, not the 4-bit one.
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Setting & Value \\
+\midrule
+Method & QLoRA, 4-bit NF4 base with double quantization \\
+LoRA & rank 16, alpha 32, dropout 0.05, on all attention and MLP projection layers \\
+Trainable parameters & 18,464,768 of 1,562,179,072 (1.18\%) \\
+Epochs and steps & 1 epoch, 613 optimizer steps \\
+Effective batch size & 16 (2 GPUs, 4 per GPU, 2 accumulation steps) \\
+Optimizer & paged AdamW 8-bit, learning rate $2\times10^{-4}$, cosine schedule, 40 warmup steps \\
+Precision & fp16 with gradient checkpointing \\
+Hardware and time & 2 NVIDIA T4 (Kaggle free tier), distributed data parallel, 3,494 seconds \\
+\bottomrule
+\end{tabularx}
+\caption{Training configuration.}
+\label{tab:setup}
+\end{table}
+
+\subsection{Evaluation}
+All models answer in chat format with the same system message and greedy decoding. We take the longest Python code block from the reply and run it against the official tests in a subprocess with a 15-second limit.
+
+We used two harness settings at different times, and we report them separately (Table~\ref{tab:harness}). For MBPP, the prompt includes the task text and the first test case, which shows the expected function name.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+ & Harness A & Harness B \\
+\midrule
+Benchmarks & HumanEval & HumanEval and MBPP \\
+Max new tokens & 512 & 384 \\
+Batch size & 8 & 16 \\
+Models scored & base, final & base, steps 200, 400, 613 \\
+\bottomrule
+\end{tabular}
+\caption{The two evaluation harness settings.}
+\label{tab:harness}
+\end{table}
+
+Each score is given with one standard error, $\sqrt{p(1-p)/n}$. Per-problem outcomes were not stored for these runs, so paired tests are not available. Section~\ref{sec:limits} returns to this.
+
+\section{Results}
+\subsection{Training}
+Training loss fell from 0.218 at step 20 to between 0.13 and 0.15 by the middle of the run and stayed there. The mean training loss was 0.145 and the final validation loss was 0.133. By these numbers alone the run looks healthy, with no sign of overfitting.
+
+The starting loss is already low. This means the base model found the training answers easy to predict before any fine-tuning.
+
+\subsection{Benchmarks across checkpoints}
+Table~\ref{tab:main} gives pass@1 under Harness B.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{HumanEval ($n=164$)} & \multicolumn{2}{c}{MBPP ($n=257$)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Model & pass@1 & solved & pass@1 & solved \\
+\midrule
+Base & 67.1\% $\pm$ 3.7 & 110 & 59.5\% $\pm$ 3.1 & 153 \\
+Step 200 & 72.0\% $\pm$ 3.5 & 118 & 65.0\% $\pm$ 3.0 & 167 \\
+Step 400 & 68.3\% $\pm$ 3.6 & 112 & 67.3\% $\pm$ 2.9 & 173 \\
+Step 613 (final) & 65.9\% $\pm$ 3.7 & 108 & 67.3\% $\pm$ 2.9 & 173 \\
+\bottomrule
+\end{tabular}
+\caption{Pass@1 with one standard error, and problems solved, under Harness B.}
+\label{tab:main}
+\end{table}
+
+\paragraph{MBPP improves.} The final model solves 20 more problems than the base, a gain of 7.8 points. An unpaired two-proportion test gives $z=1.84$ and a two-sided $p$ of about 0.07. This is suggestive, not conclusive. All three checkpoints score above the base, which supports the direction of the effect.
+
+\paragraph{HumanEval does not improve.} The final model solves 2 fewer problems than the base ($p$ about 0.8). The best checkpoint, step 200, solves 8 more than the base, but that difference is also within noise ($p$ about 0.3).
+
+\paragraph{The gain arrives early.} MBPP rises from 153 to 167 solved by step 200 and to 173 by step 400. The last 213 steps add nothing. On HumanEval the count falls from 118 at step 200 to 108 at the end, though this decline is within noise as well.
+
+\subsection{Harness sensitivity}
+Under Harness A the same two models score higher on HumanEval than under Harness B (Table~\ref{tab:sens}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Model & Harness A & Harness B \\
+\midrule
+Base & 68.9\% (113 solved) & 67.1\% (110 solved) \\
+Final (step 613) & 67.7\% (111 solved) & 65.9\% (108 solved) \\
+\bottomrule
+\end{tabular}
+\caption{HumanEval pass@1 for the same models under two harness settings.}
+\label{tab:sens}
+\end{table}
+
+Both models lose exactly 3 problems when the answer limit drops from 512 to 384 tokens and the batch size rises from 8 to 16. The gap between the models stays at 2 problems in both harnesses. So the comparison is stable, but the absolute numbers are not. A reader who compared our Harness B fine-tune score (65.9\%) with our Harness A base score (68.9\%) would see a 3-point loss that is not real.
+
+\section{Discussion}
+\paragraph{Why would one benchmark move and not the other?} We did not test the cause, so what follows is a hypothesis. The training examples look like MBPP: a task described in plain language, answered with a complete program. HumanEval asks for something else, the completion of a given signature and docstring. The fine-tune may have taught the model the answer format of one task type more than new programming ability. The low starting loss fits this reading, because the model already knew most of the content.
+
+\paragraph{Training loss did not predict benchmark results.} The loss curve and validation loss looked equally good from step 200 to step 613. The benchmark scores did not improve over that range. A practitioner who watched only the loss would have trained three times longer than needed.
+
+\paragraph{Choosing the best checkpoint is a trap.} Step 200 has the highest HumanEval score. Publishing it for that reason would mean selecting on the test set, which inflates the reported number. A checkpoint should be chosen on separate validation problems and scored on the test set once.
+
+\paragraph{What this means for small fine-tunes.} A single benchmark number, without an error bar and without the harness settings, tells a reader very little. With 164 problems, one standard error is about 3.7 points. Many differences reported between community models are smaller than that. We suggest a minimum reporting standard for low-budget fine-tunes:
+\begin{itemize}
+\item Score the base model and the fine-tune in the same harness, in the same session.
+\item Use at least two benchmarks with different task formats.
+\item Report problems solved, the total, and a standard error.
+\item State the decoding settings, the token limit and the prompt.
+\item Save per-problem results so paired tests are possible.
+\end{itemize}
+
+\section{Engineering lessons for free-tier training}
+These are not research findings, but each one cost time, and they decide whether a zero-budget study finishes.
+
+\paragraph{Work stored only in the session can vanish.} An earlier run on 20,000 examples trained for about 3.5 hours on one GPU and reached a validation loss of 0.125. The session was then reset and every file was lost, including local checkpoints, before any benchmark was run. In the second run each checkpoint (about 74\,MB of adapter weights) was uploaded to a model hub every 100 steps. After that, the session ending had no effect on the study.
+
+\paragraph{The second GPU needs a real distributed launch.} Running the trainer in a notebook cell uses one GPU reliably. Launching two processes with a distributed runner cut the step time from about 10 seconds to about 5.8 seconds, a speed-up of about 1.7 times.
+
+\paragraph{Libraries change under you.} Two training arguments had been removed in the installed library version, and an unrelated preinstalled package failed a version check during adapter loading. Code that drops unsupported arguments with a warning, and pinned versions, would have avoided three failed launches.
+
+\paragraph{Merge into full precision.} The adapter was trained on a 4-bit base but merged into the fp16 base for release and evaluation, so the published weights are not degraded by quantization.
+
+\paragraph{Stream large datasets.} Streaming with a shuffle buffer gave a filtered 10,000-example sample in a few minutes without downloading the full dataset.
+
+\section{Limitations}
+\label{sec:limits}
+\begin{itemize}
+\item \textbf{One seed, one run.} Every number comes from a single training run. A second seed could move the scores by several points.
+\item \textbf{Small benchmarks.} With 164 and 257 problems, only large differences can be confirmed. The MBPP gain does not reach the usual 0.05 threshold.
+\item \textbf{No paired test.} Per-problem results were not saved, so we used an unpaired test, which is less sensitive. A paired test could strengthen or weaken the MBPP result.
+\item \textbf{Custom harness.} Our scores are not comparable with public leaderboards. The base model's HumanEval score changed by 3 problems between our own two settings.
+\item \textbf{Original test suites.} We used the original tests, which are known to accept some wrong solutions~\cite{evalplus}.
+\item \textbf{Possible overlap.} We did not check whether the synthetic training data contains problems similar to the benchmark problems.
+\item \textbf{The cause is untested.} The format explanation in the discussion is a hypothesis.
+\item \textbf{One model, one dataset, one language.} The findings may not hold for other sizes or data.
+\item \textbf{The lost first run.} The 20,000-example run was never benchmarked, so we cannot say whether more data helps.
+\end{itemize}
+
+\section{Conclusion and future work}
+One hour of QLoRA fine-tuning on free GPUs gave a model that is no better than its base on HumanEval and 7.8 points higher on MBPP. Which of these a reader sees decides what they believe about the model. The gain came in the first third of training, and the loss curve gave no warning that the rest was wasted. Harness settings alone moved scores by more than the difference between the models on HumanEval.
+
+The practical message is that small fine-tunes should be reported with two benchmarks, error bars and the full harness settings, against a base model scored in the same session.
+
+In future work we will test whether data selection helps: scoring candidate examples with the base model and training only on the hardest ones, at a lower learning rate. That evaluation will choose the checkpoint on held-out validation problems, score the test sets once, and save per-problem results for an exact paired test. Further steps are multiple seeds, the extended test suites of~\cite{evalplus}, and a narrow task where the base model is weak.
+
+\section*{Availability}
+The merged model and its model card are public at \url{https://huggingface.co/2003Rohansinha/Qwen2.5-Coder-1.5B-Python-OCI-LoRA}.
+
+\section*{Acknowledgments}
+An AI assistant (Claude, by Anthropic) was used to write the training and evaluation scripts and to help draft this text. The author ran all experiments and is responsible for the results and claims.
+
+\begin{thebibliography}{9}
+\bibitem{qwen} B. Hui et al. Qwen2.5-Coder Technical Report. arXiv:2409.12186, 2024.
+\bibitem{oci} W. U. Ahmad, A. Ficek, M. Samadi, J. Huang, V. Noroozi, S. Majumdar, B. Ginsburg. OpenCodeInstruct: A Large-scale Instruction Tuning Dataset for Code LLMs. arXiv:2504.04030, 2025.
+\bibitem{lora} E. J. Hu et al. LoRA: Low-Rank Adaptation of Large Language Models. arXiv:2106.09685, 2021.
+\bibitem{qlora} T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. QLoRA: Efficient Finetuning of Quantized LLMs. arXiv:2305.14314, 2023.
+\bibitem{humaneval} M. Chen et al. Evaluating Large Language Models Trained on Code. arXiv:2107.03374, 2021.
+\bibitem{mbpp} J. Austin et al. Program Synthesis with Large Language Models. arXiv:2108.07732, 2021.
+\bibitem{evalplus} J. Liu, C. S. Xia, Y. Wang, L. Zhang. Is Your Code Generated by ChatGPT Really Correct? Rigorous Evaluation of Large Language Models for Code Generation. arXiv:2305.01210, 2023.
+\end{thebibliography}
+\end{document}

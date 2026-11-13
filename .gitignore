@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.safetensors
+*.bin
+*.pt
+checkpoint-*/
+merged/
+.env
+*.log
+*.aux
+*.out
